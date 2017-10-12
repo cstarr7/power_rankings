@@ -2,7 +2,7 @@
 # @Author: Charles Starr
 # @Date:   2017-09-23 16:30:04
 # @Last Modified by:   Charles Starr
-# @Last Modified time: 2017-10-03 22:13:26
+# @Last Modified time: 2017-10-12 17:04:34
 
 from lxml import html
 from lxml import etree
@@ -27,12 +27,18 @@ class Owner(object):
         self.league_id = league_id
         self.wins = wins
         self.losses = losses
+        self.games_played = self.wins + self.losses
         self.current_rank = rank
         self.scores = []
         self.final_opponents = self.schedule_data()
         self.win_percentage = self.calc_win_percentage()
         self.total_points = np.sum(self.scores)
         self.roster = self.populate_roster()
+        self.lineup_scores = []
+        self.lineup_deviations = []
+        self.simulated_totals = []
+        self.simulated_wins = []
+        self.simulated_losses = []
 
     def schedule_data(self):
         # get info about games played and games remaining
@@ -81,6 +87,33 @@ class Owner(object):
 
     	return roster
 
+    def set_lineups(self, league):
+
+    	for week in range(0, 17, 1):
+    		positions = ['QB', 'RB', 'RB', 'WR', 'WR', 'TE', 'FLEX', 'K', 'D/ST']
+    		weekly_scores = []
+    		weekly_deviations = []
+    		
+    		self.roster.sort(key = lambda player: player.projected_scores[week], reverse = True)
+    		for player in self.roster:
+    			if player.position in positions:
+    				weekly_scores.append(player.projected_scores[week])
+    				weekly_deviations.append(player.scoring_stdev)
+    				positions.remove(player.position)
+    			elif 'FLEX' in positions and player.position in ['RB', 'WR', 'TE']:
+    				weekly_scores.append(player.projected_scores[week])
+    				weekly_deviations.append(player.scoring_stdev)
+    				positions.remove('FLEX')
+    			else:
+    				continue
+
+    		for position in positions:
+    			weekly_scores.append(league.positional_scores[position])
+    			weekly_deviations.append(league.positional_deviations[position])
+    		
+    		self.lineup_scores.append(weekly_scores)
+    		self.lineup_deviations.append(weekly_deviations)
+
     def __cmp__(self, other):
 
         if self.win_percentage > other.win_percentage:
@@ -98,6 +131,46 @@ class Owner(object):
 
         return self.name_complex
 
+class SimulationOwner(Owner):
+    #a copy of each owner is created for each simulation
+    
+    def __init__(self, owner): #passing owners from ownerlist for temporary sim class
+
+        self.owner = owner
+        self.name_complex = owner.name_complex
+        self.wins = owner.wins
+        self.losses = owner.losses
+        self.games_played = owner.games_played      
+        self.scores = copy.deepcopy(owner.scores)
+        self.total_points = owner.total_points
+        self.final_opponents = owner.final_opponents
+        self.lineup_scores = np.array(owner.lineup_scores)
+        self.lineup_deviations = np.array(owner.lineup_deviations)
+        self.simulated_points = self.simulate_point_total() #simulated point total
+        self.final_rank = 0
+    
+    def simulate_point_total(self):
+
+        simulated_points = []
+        for game in range(self.games_played, 13, 1):
+        	scores = self.lineup_scores[game]
+        	deviations = self.lineup_deviations[game]
+    		game_score = 0.0
+    		
+    		for score, deviation in np.nditer([scores, deviations]):
+    			player_score = (random.gauss(score, deviation))
+    			if player_score < 0.0:
+    				player_score = 0.0
+    			game_score += player_score
+           
+           	simulated_points.append(game_score)
+        
+        self.total_points += sum(simulated_points)
+        self.scores.extend(simulated_points)
+        self.owner.simulated_totals.append(self.total_points)
+
+        return simulated_points
+
 
 class Player(object):
 
@@ -111,11 +184,8 @@ class Player(object):
 		self.abbr_team = None
 		self.scoring_average = 0.0
 		self.scoring_stdev = 0.0
-		self.remaining_schedule = []
-
+		self.schedule = []
 		self.projected_scores = []
-
-
 
 	def name_trim(self):
 
@@ -127,11 +197,28 @@ class Player(object):
 
 		return
 
-	def calculate_scoring_stats(self, positional_average):
+	def calculate_scoring_stats(self, positional_average, lookback):
 
-		score_count = 
+		score_count = lookback - len(self.game_scores)
+		if score_count > 0:
+			self.game_scores.extend([positional_average]*score_count)
+		self.scoring_average = np.mean(self.game_scores)
+		self.scoring_stdev = np.std(self.game_scores)
 
-		
+		return
+
+	def make_projections(self, schedule_table, defense_matrix):
+
+		schedule = schedule_table.loc[self.full_team, :]
+		for opponent in schedule:
+			if opponent == 'Bye':
+				self.projected_scores.append(0.0)
+			else:
+				self.projected_scores.append(
+					self.scoring_average * defense_matrix.loc[opponent, self.position]
+					)
+
+		return
 
 	def __str__(self):
 
@@ -140,29 +227,36 @@ class Player(object):
 
 class Simulation(object):
 
-    def __init__(self, league_id, stats_id, year, complete_weeks, sim_count):
+    def __init__(self, league_id, stats_id, year, complete_weeks, lookback, sim_count):
 
         self.league_id = league_id
         self.stats_id = stats_id
         self.year = year
         self.complete_weeks = complete_weeks
+        self.lookback = lookback
         self.sim_count = sim_count
         self.owner_list = self.populate_owners()
-        self.rank_table = self.build_table()
+        self.rank_table = self.build_rank_table()
+        self.output_table = self.build_out_table()
         self.owner_list.sort(reverse=True)
         self.positional_scores = {
         						'QB': [], 'RB': [], 'WR': [],
         						'TE': [], 'K': [], 'D/ST': []
         						}
+        self.positional_deviations = copy.deepcopy(self.positional_scores)
+
         self.team_dict = {}
         self.player_list = []
         self.populate_players()
         self.populate_stats()
+        self.populate_defense_teams()
         self.calculate_player_stats()
         self.defense_matrix = self.build_defense_matrix()
         self.populate_defense_stats()
         self.schedule_table = self.build_schedule_table()
         self.populate_schedule()
+        self.adjust_player_projections()
+        self.set_lineups()
         self.run_simulation()
         self.calculate_percentages()
         self.finish_simulation()
@@ -171,15 +265,22 @@ class Simulation(object):
 
         pass
 
-    def build_table(self):
+    def build_rank_table(self):
 
-    	columns = ['Team', 'Current Record', 'Current Rank', 'Current Points',
-    		'Points Rank', 'Projected Record', 'Projected Points', 'Playoff Odds'
+        table = pd.DataFrame(0, index = [owner.name_complex for owner in self.owner_list],
+            columns = ['Current'] + range(1, len(self.owner_list) + 1))
+        table.index.name = 'Team'
+        table['Current'] = range(1, len(self.owner_list) + 1)
+        return table
+
+    def build_out_table(self):
+
+    	columns = ['Current Wins', 'Current Rank', 'Current Points',
+			'Projected Wins', 'Projected Points', 'Playoff Odds'
     		]
         table = pd.DataFrame(0, index=[owner.name_complex for owner in self.owner_list],
             columns=columns)
-        table.index.name = 'Team'
-        table['Current'] = range(1, len(self.owner_list) + 1)
+
         return table
 
     def populate_players(self):
@@ -201,7 +302,6 @@ class Simulation(object):
     	defense_table = html.fromstring(requests.get(defense_url).text)
 
     	for player in self.player_list:
-    		game_log = []
 
     		if player.position != 'D/ST':
     			last_name = player.player_name[player.player_name.find(' ') + 1:]
@@ -227,7 +327,7 @@ class Simulation(object):
     					html_defense = html.fromstring(requests.get(url).text)
     					self.extract_games(player, html_defense)
 
-    		self.positional_scores[player.position].extend(game_log)
+    		self.positional_scores[player.position].extend(player.game_scores)
 
     	return
 
@@ -235,10 +335,14 @@ class Simulation(object):
 
     	for position in self.positional_scores.iterkeys():
     		mean = np.mean(self.positional_scores[position])
+    		stdev = np.std(self.positional_scores[position])
     		self.positional_scores[position] = mean
+    		self.positional_deviations[position] = stdev
 
     	for player in self.player_list:
-    		player.calculate_scoring_stats(self.positional_scores[player.position])
+    		player.calculate_scoring_stats(
+    			self.positional_scores[player.position], self.lookback
+    			)
 
     	return
 
@@ -266,6 +370,17 @@ class Simulation(object):
 		player.abbr_team = abbr_team
 		if full_team != 'Free Agent':
 			self.team_dict[full_team] = abbr_team
+
+		return
+
+    def populate_defense_teams(self):
+
+		for player in self.player_list:
+			if player.position == 'D/ST':
+				for team_name in self.team_dict.iterkeys():
+					if player.player_name[:-5] in team_name:
+						player.full_team = team_name
+						player.team_abbr = self.team_dict[team_name]
 
 		return
 
@@ -355,10 +470,37 @@ class Simulation(object):
 
 		return
 
+    def adjust_player_projections(self):
 
+		for player in self.player_list:
+			if player.full_team != 'Free Agent':
+				player.make_projections(self.schedule_table, self.defense_matrix)
+			else:
+				player.projected_scores = [0.0] * 17
+
+		return
+
+    def set_lineups(self):
+
+		for owner in self.owner_list:
+			owner.set_lineups(self)
+
+		return
 
     def run_simulation(self):
-		pass
+
+        for i in range(1, self.sim_count+1):
+            if i%1000 == 0:
+                print i
+            simulated_owners = {owner.name_complex:SimulationOwner(owner) 
+                for owner in self.owner_list
+                }
+            self.play_games(simulated_owners)
+            simulated_rankings = sorted(simulated_owners.values(),
+                reverse = True
+                )
+            self.wild_card(simulated_rankings)
+            self.update_table(simulated_rankings)
 
     def play_games(self, simulated_owners):
 
@@ -369,6 +511,8 @@ class Simulation(object):
                     sim_owner.wins += 1
                 elif week_simulation < simulated_owners[opponent.name_complex].simulated_points[index]:
                     sim_owner.losses += 1
+            sim_owner.owner.simulated_wins.append(sim_owner.wins)
+            sim_owner.owner.simulated_losses.append(sim_owner.losses)
             sim_owner.calc_win_percentage()
         return
 
@@ -387,20 +531,37 @@ class Simulation(object):
     def calculate_percentages(self):
 
         self.rank_table.ix[:, 1:] = self.rank_table.ix[:, 1:] / float(self.sim_count) * 100
+        self.rank_table['Playoff Odds'] = self.rank_table.iloc[:, 1:7].sum(axis=1)
         return
 
     def finish_simulation(self):
 
-        writer = pd.ExcelWriter('classes_test.xlsx')
+        writer = pd.ExcelWriter('playoff_odds.xlsx')
         self.rank_table.to_excel(writer)
+        writer.save()
+
+        writer = pd.ExcelWriter('power_rankings.xlsx')
+
+        for owner in self.owner_list:
+        	self.output_table.loc[owner.name_complex, 'Current Wins'] = owner.wins
+        	self.output_table.loc[owner.name_complex, 'Current Rank'] = owner.current_rank
+        	self.output_table.loc[owner.name_complex, 'Current Points'] = owner.total_points
+        	self.output_table.loc[owner.name_complex, 'Projected Wins'] = np.mean(owner.simulated_wins)
+        	self.output_table.loc[owner.name_complex, 'Projected Points'] = np.mean(owner.simulated_totals)
+        	playoff_odds = self.rank_table.loc[owner.name_complex, 'Playoff Odds']
+        	self.output_table.loc[owner.name_complex, 'Playoff Odds'] = playoff_odds
+
+        self.output_table.sort(columns = 'Projected Points', ascending = False, inplace = True)
+
+        self.output_table.to_excel(writer)
         writer.save()
 
 
 class ESPNSimulation(Simulation):
 
-    def __init__(self, league_id, stats_id, year, complete_weeks, sim_count):
+    def __init__(self, league_id, stats_id, year, complete_weeks, lookback, sim_count):
 
-        super(ESPNSimulation, self).__init__(league_id, stats_id, year, complete_weeks, sim_count)
+        super(ESPNSimulation, self).__init__(league_id, stats_id, year, complete_weeks, lookback, sim_count)
 
     def populate_owners(self):
 
@@ -426,7 +587,7 @@ class ESPNSimulation(Simulation):
 
 def main():
     
-    ESPNSimulation('392872', '191290', '2017', 3, 10)
+    ESPNSimulation('392872', '191290', '2017', 5, 12, 10)
     '''
     league_id = raw_input('Please enter your league ID number?')
     stats_id = raw_input('Please enter your stats ID number?')
